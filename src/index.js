@@ -2,7 +2,7 @@ import path from 'path'
 import { createFilter } from 'rollup-pluginutils'
 import Concat from 'concat-with-sourcemaps'
 import Loaders from './loaders'
-import normalizePath from './utils/normalize-path';
+import normalizePath from './utils/normalize-path'
 
 /**
  * The options that could be `boolean` or `object`
@@ -17,10 +17,12 @@ function inferOption(option, defaultValue) {
 
 export default (options = {}) => {
   const filter = createFilter(options.include, options.exclude)
-  const postcssPlugins = Array.isArray(options.plugins) ?
-    options.plugins.filter(Boolean) :
-    options.plugins
+  const postcssPlugins = Array.isArray(options.plugins)
+    ? options.plugins.filter(Boolean)
+    : options.plugins
   const sourceMap = options.sourceMap
+  const getRelatedModulesForEntry = options.getRelatedModulesForEntry
+  const extension = options.extension
   const postcssLoaderOptions = {
     /** Inject CSS as `<style>` to `<head>` */
     inject: inferOption(options.inject, {}),
@@ -41,8 +43,8 @@ export default (options = {}) => {
       plugins: postcssPlugins,
       syntax: options.syntax,
       stringifier: options.stringifier,
-      exec: options.exec
-    }
+      exec: options.exec,
+    },
   }
   const use = options.use || ['sass', 'stylus', 'less']
   use.unshift(['postcss', postcssLoaderOptions])
@@ -50,7 +52,7 @@ export default (options = {}) => {
   const loaders = new Loaders({
     use,
     loaders: options.loaders,
-    extensions: options.extensions
+    extensions: options.extensions,
   })
 
   const extracted = new Map()
@@ -72,13 +74,13 @@ export default (options = {}) => {
         sourceMap,
         dependencies: new Set(),
         warn: this.warn.bind(this),
-        plugin: this
+        plugin: this,
       }
 
       const res = await loaders.process(
         {
           code,
-          map: undefined
+          map: undefined,
         },
         loaderContext
       )
@@ -91,43 +93,35 @@ export default (options = {}) => {
         extracted.set(id, res.extracted)
         return {
           code: res.code,
-          map: { mappings: '' }
+          map: { mappings: '' },
         }
       }
 
       return {
         code: res.code,
-        map: res.map || { mappings: '' }
+        map: res.map || { mappings: '' },
       }
     },
 
     async generateBundle(opts, bundle) {
       if (extracted.size === 0) return
 
-      // TODO: support `[hash]`
       const dir = opts.dir || path.dirname(opts.file)
-      const file =
-        opts.file ||
-        path.join(
-          opts.dir,
-          Object.keys(bundle).find(fileName => bundle[fileName].isEntry)
-        )
-      const getExtracted = () => {
-        const fileName =
-          typeof postcssLoaderOptions.extract === 'string' ?
-            path.relative(dir, postcssLoaderOptions.extract) :
-            `${path.basename(file, path.extname(file))}.css`
-        const concat = new Concat(true, fileName, '\n')
-        const entries = Array.from(extracted.values())
-        const { modules } = bundle[normalizePath(path.relative(dir, file))]
 
-        if (modules) {
-          const fileList = Object.keys(modules)
-          entries.sort(
-            (a, b) => fileList.indexOf(a.id) - fileList.indexOf(b.id)
-          )
-        }
-        for (const res of entries) {
+      const getExtracted = (chunk, modules) => {
+        // TODO: support `[hash]`
+        const file = chunk.fileName
+        const fileName = path.join(
+          path.dirname(file),
+          path.basename(file, path.extname(file)) + extension
+        )
+
+        const concat = new Concat(true, fileName, '\n')
+        const contents = Array.from(extracted.values())
+          .filter(e => modules.find(m => m === e.id))
+          .sort((a, b) => modules.indexOf(a.id) - modules.indexOf(b.id))
+
+        for (const res of contents) {
           const relative = path.relative(dir, res.id)
           const map = res.map || null
           if (map) {
@@ -150,53 +144,59 @@ export default (options = {}) => {
           code,
           map: sourceMap === true && concat.sourceMap,
           codeFileName: fileName,
-          mapFileName: fileName + '.map'
+          mapFileName: fileName + '.map',
         }
       }
 
-      if (options.onExtract) {
-        const shouldExtract = await options.onExtract(getExtracted)
-        if (shouldExtract === false) {
+      Object.keys(bundle).forEach(async key => {
+        const chunk = bundle[key]
+
+        if (!chunk.isEntry) {
           return
         }
-      }
 
-      let { code, codeFileName, map, mapFileName } = getExtracted()
-      // Perform cssnano on the extracted file
-      if (postcssLoaderOptions.minimize) {
-        const cssOpts = postcssLoaderOptions.minimize
-        cssOpts.from = codeFileName
-        if (sourceMap === 'inline') {
-          cssOpts.map = { inline: true }
-        } else if (sourceMap === true && map) {
-          cssOpts.map = { prev: map }
-          cssOpts.to = codeFileName
+        const modules = getRelatedModulesForEntry(chunk, bundle)
+
+        let { code, codeFileName, map, mapFileName } = getExtracted(
+          chunk,
+          modules
+        )
+        // Perform cssnano on the extracted file
+        if (postcssLoaderOptions.minimize) {
+          const cssOpts = postcssLoaderOptions.minimize
+          cssOpts.from = codeFileName
+          if (sourceMap === 'inline') {
+            cssOpts.map = { inline: true }
+          } else if (sourceMap === true && map) {
+            cssOpts.map = { prev: map }
+            cssOpts.to = codeFileName
+          }
+
+          const result = await require('cssnano').process(code, cssOpts)
+          code = result.css
+
+          if (sourceMap === true && result.map && result.map.toString) {
+            map = result.map.toString()
+          }
         }
 
-        const result = await require('cssnano').process(code, cssOpts)
-        code = result.css
-
-        if (sourceMap === true && result.map && result.map.toString) {
-          map = result.map.toString()
-        }
-      }
-
-      const codeFile = {
-        fileName: codeFileName,
-        isAsset: true,
-        type: 'asset',
-        source: code
-      }
-      bundle[codeFile.fileName] = codeFile
-      if (map) {
-        const mapFile = {
-          fileName: mapFileName,
+        const codeFile = {
+          fileName: codeFileName,
           isAsset: true,
           type: 'asset',
-          source: map
+          source: code,
         }
-        bundle[mapFile.fileName] = mapFile
-      }
-    }
+        bundle[codeFile.fileName] = codeFile
+        if (map) {
+          const mapFile = {
+            fileName: mapFileName,
+            isAsset: true,
+            type: 'asset',
+            source: map,
+          }
+          bundle[mapFile.fileName] = mapFile
+        }
+      })
+    },
   }
 }
